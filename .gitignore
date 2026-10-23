@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+data/
+deploy/.deploy_synology.env
+deploy/.env.production
+.venv/

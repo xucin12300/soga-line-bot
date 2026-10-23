@@ -1,0 +1,5 @@
+flask==3.1.2
+requests==2.32.5
+gunicorn==23.0.0
+# zoneinfo needs this: python:slim and Windows ship no tz database.
+tzdata==2025.2
