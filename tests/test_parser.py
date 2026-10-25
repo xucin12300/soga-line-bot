@@ -62,3 +62,24 @@ class ParseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NextWeekTest(unittest.TestCase):
+    def slots(self, text, today=TODAY):
+        command = parse(text, today)
+        self.assertIsNotNone(command, text)
+        return command.action, [s.key + s.day.strftime("@%m%d") for s in command.slots], command.body
+
+    def test_next_week_prefix(self):
+        # 今天 10/23 週五；下週是 10/26 那週。
+        self.assertEqual(self.slots("+下禮拜的六午"), ("add", ["六午@1031"], ""))
+        self.assertEqual(self.slots("+ 下下禮拜的六午"), ("add", ["六午@1107"], ""))
+        self.assertEqual(self.slots("+下週五晚"), ("add", ["五晚@1030"], ""))
+        self.assertEqual(self.slots("+下周 一晚 三晚"), ("add", ["一晚@1026", "三晚@1028"], ""))
+        self.assertEqual(self.slots("+下個星期的日午 晚點到"), ("add", ["日午@1101"], "晚點到"))
+        self.assertEqual(self.slots("-下禮拜的六午"), ("remove", ["六午@1031"], ""))
+
+    def test_next_week_is_calendar_week_even_on_monday(self):
+        monday = date(2026, 10, 26)
+        self.assertEqual(self.slots("+下禮拜的一晚", monday), ("add", ["一晚@1102"], ""))
+        self.assertEqual(self.slots("+一晚", monday), ("add", ["一晚@1026"], ""))

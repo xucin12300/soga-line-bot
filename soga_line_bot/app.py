@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 from datetime import date, datetime, timedelta
@@ -25,7 +26,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request
 
 from . import parser
-from .line_api import LineClient, verify_signature
+from .line_api import LineClient, mention, verify_signature
 from .parser import TZ, WEEKDAYS, Command, Slot, week_start
 from .players import SogaPlayers
 from .store import SignupStore
@@ -50,6 +51,7 @@ HELP_TEXT = """📋 SOGA 登記小幫手
 ・+五晚 → 登記這週五晚上
 ・+一晚 三晚 → 一次登記好幾個
 ・+六晚 晚點到 → 後面的字當備註
+・+下禮拜的六午 → 指定下週（下下禮拜＝下下週）
 　已經登記過的再打一次就是改備註
 　星期：一～日　時段：早 午 晚 夜
 　已經過了的日子會登記到下週
@@ -66,7 +68,9 @@ HELP_TEXT = """📋 SOGA 登記小幫手
 　LINE 名字跟 SOGA 一樣的話會自動綁定
 ・綁定 → 查目前綁的是誰
 
-📌 每個時段最多 {capacity} 人，滿了就登記不進去
+📌 每個時段 {capacity} 人，第 {next} 個以後是備取
+　前面有人取消，備取自動遞補
+　第 {next} 個以後要寫備註，沒寫就是（備取）
 📌 固定班底每週自動帶入，不能來請自己 -
 📌 兩個群組共用同一張表
 ・說明 → 再看一次這段"""
@@ -97,6 +101,17 @@ def create_app(config: dict | None = None) -> Flask:
         package_logger.addHandler(handler)
         package_logger.setLevel(logging.INFO)
         package_logger.propagate = False
+        # 另外寫一份到 data 目錄：每次部署都會重建容器，docker logs 跟著清空，
+        # 出事時常常已經查不到（2026-10-23 一則「+一晚…日晚」就這樣查不到）。
+        # 1MB × 5 份輪替，最多約 6MB，不會膨脹。
+        log_dir = os.getenv("SOGA_LINE_BOT_LOG_DIR", "/data/logs")
+        if os.path.isdir(os.path.dirname(log_dir)):
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                os.path.join(log_dir, "bot.log"), maxBytes=1_000_000, backupCount=5, encoding="utf-8"
+            )
+            file_handler.setFormatter(handler.formatter)
+            package_logger.addHandler(file_handler)
     app = Flask(__name__)
     app.config.update(
         LINE_CHANNEL_SECRET=os.getenv("LINE_CHANNEL_SECRET", ""),
@@ -120,7 +135,7 @@ def create_app(config: dict | None = None) -> Flask:
     if config:
         app.config.update(config)
 
-    store = SignupStore(app.config["DB_PATH"])
+    store = SignupStore(app.config["DB_PATH"], app.config["SLOT_CAPACITY"])
     players = app.config.get("PLAYERS") or SogaPlayers(app.config["SOGA_DB_PATH"])
     line = app.config.get("LINE_CLIENT") or LineClient(app.config["LINE_CHANNEL_ACCESS_TOKEN"])
     # 改用 player id 綁定之前就綁好的人，補上 id。
@@ -131,6 +146,10 @@ def create_app(config: dict | None = None) -> Flask:
 
     def now() -> datetime:
         return app.config["NOW"]()
+
+    def help_text() -> str:
+        capacity = app.config["SLOT_CAPACITY"]
+        return HELP_TEXT.format(capacity=capacity, next=capacity + 1)
 
     @app.get("/health")
     def health():
@@ -165,7 +184,7 @@ def create_app(config: dict | None = None) -> Flask:
         remember_chat(source, chat_id)
 
         if event.get("type") == "join" and not readonly:
-            line.reply_text(event["replyToken"], HELP_TEXT.format(capacity=app.config["SLOT_CAPACITY"]))
+            line.reply_text(event["replyToken"], help_text())
             return
         message = event.get("message", {})
         if event.get("type") != "message" or message.get("type") != "text":
@@ -191,7 +210,7 @@ def create_app(config: dict | None = None) -> Flask:
 
     def run_command(command: Command, source: dict, chat_id: str) -> str:
         if command.action == "help":
-            text = HELP_TEXT.format(capacity=app.config["SLOT_CAPACITY"])
+            text = help_text()
             if source.get("userId") in app.config["ADMIN_USER_IDS"]:
                 text += "\n\n" + ADMIN_HELP_TEXT
             return text
@@ -228,32 +247,39 @@ def create_app(config: dict | None = None) -> Flask:
         for start in touched:
             seed(start, defaults)
         if command.action == "add":
-            capacity = app.config["SLOT_CAPACITY"]
-            results: dict[str, list[str]] = {"added": [], "noted": [], "exists": [], "full": []}
+            results: dict[str, list[str]] = {"added": [], "waitlisted": [], "noted": [], "exists": []}
             for slot in command.slots:
-                results[store.add(chat_id, user_id, slot, capacity, current, command.body)].append(slot.key)
+                results[store.add(chat_id, user_id, slot, current, command.body)].append(slot.key)
             note = f"（{command.body}）" if command.body else ""
             lines = []
             if results["added"]:
                 lines.append(f"✅ {name} +{' '.join(results['added'])}{note}")
+            if results["waitlisted"]:
+                lines.append(f"🕒 {name} +{' '.join(results['waitlisted'])}{note or '（備取）'}")
             if results["noted"]:
                 lines.append(f"📝 {name} {' '.join(results['noted'])} 備註改成{note}")
             if results["exists"]:
                 lines.append(f"👌 {name} 已經登記過 {' '.join(results['exists'])}")
-            if results["full"]:
-                lines.append(f"❌ {' '.join(results['full'])} 已經滿 {capacity} 人了")
             head = "\n".join(lines)
             slots = command.slots
         elif command.action == "remove":
-            changed = [s for s in command.slots if store.remove(user_id, s, current)]
+            changed, promoted = [], {}
+            for slot in command.slots:
+                removed, ids = store.remove(user_id, slot, current)
+                if removed:
+                    changed.append(slot)
+                if ids:
+                    promoted[slot] = ids
             head = f"🗑 {name} -{' '.join(s.key for s in changed)}" if changed else f"{name} 沒有登記這個時段"
+            head += promotion_lines(promoted, source, chat_id)
             slots = command.slots
         else:  # cancel_all
-            slots = store.remove_all(user_id, current.date(), current)
+            slots, promoted = store.remove_all(user_id, current.date(), current)
             if not slots:
                 return f"{name} 目前沒有登記"
             # 跨週時同一個「三晚」可能有兩個，帶上日期才分得清。
             head = f"🗑 {name} 全部取消：{' '.join(f'{s.key}({s.day.month}/{s.day.day})' for s in slots)}"
+            head += promotion_lines(promoted, source, chat_id)
         weeks = sorted({week_start(s.day) for s in slots})
         return head + "\n\n" + "\n\n".join(board_text(w) for w in weeks)
 
@@ -281,6 +307,55 @@ def create_app(config: dict | None = None) -> Flask:
             store.set_slot(slot, [], current, players.canonical)
         logger.info("管理員覆蓋 %s 那週：%s", start, board)
         return "✅ 已覆蓋整張表\n\n" + board_text(start)
+
+    def promotion_lines(promoted: dict, source: dict, chat_id: str) -> str:
+        """「⬆️ 小米 @VIKI 遞補 五晚」——備取的人被叫到時，在回覆裡講一聲並 @ 他。
+
+        被遞補的人就在這個群組 → 直接在這則回覆 @ 他（回覆免費）。不在這個群組
+        （他在另一群登記的）→ 回覆裡只寫名字，另外到他所在的群組推一則 @ 他（推播
+        要扣額度，見 notify_in_own_group）。還沒綁定 LINE 的班底沒辦法 @，只寫名字。
+        """
+        lines = []
+        for slot, user_ids in sorted(promoted.items(), key=lambda item: item[0].sort_key):
+            known = {e.user_id: e for e in store.entries(slot.day, slot.day) if e.slot == slot}
+            names = []
+            for user_id in user_ids:
+                entry = known.get(user_id)
+                if entry is None:
+                    continue
+                name = players.current_name(entry.player_id) or players.canonical(entry.name)
+                if user_id.startswith("name:"):
+                    names.append(name)
+                elif line.is_member(source.get("type", ""), chat_id, user_id):
+                    names.append(f"{name} {mention(user_id)}")
+                else:
+                    names.append(name)
+                    notify_in_own_group(user_id, name, slot, entry.chat_id, chat_id)
+            if names:
+                lines.append(f"⬆️ {' '.join(names)} 遞補 {slot.key}")
+        return "".join("\n" + line for line in lines)
+
+    def notify_in_own_group(user_id: str, name: str, slot: Slot, signed_up_in: str, current_chat: str) -> None:
+        """到被遞補的人所在的群組推一則 @ 他。先找他當初登記的那一群，不在的話找
+        其他可以登記的群組。推播按群組人數扣額度（免費方案每月 200 則），額度不夠就
+        不推，只留 log。"""
+        candidates = [signed_up_in] + sorted(app.config["ALLOWED_CHAT_IDS"])
+        for group in dict.fromkeys(candidates):
+            if group == current_chat or not group.startswith(("C", "R")):
+                continue
+            chat_type = "group" if group.startswith("C") else "room"
+            if not line.is_member(chat_type, group, user_id):
+                continue
+            cost = line.member_count(chat_type, group) or 0
+            left = line.quota_left()
+            if left is not None and left < cost:
+                logger.warning("推播額度剩 %s、這群要 %s，不推遞補通知（%s %s）", left, cost, name, slot.key)
+                return
+            text = f"⬆️ {name} {mention(user_id)} 遞補 {slot.key}（{slot.day.month}/{slot.day.day}）"
+            if line.push_text(group, text):
+                logger.info("到 %s 推播遞補通知：%s %s（約扣 %s 則）", group, name, slot.key, cost)
+            return
+        logger.info("找不到 %s 所在的群組，遞補只寫在回覆裡", name)
 
     def defaults_text(defaults: list) -> str:
         return "\n".join(f"{WEEKDAYS[weekday]}{period} {' '.join(names)}".rstrip() for weekday, period, names in defaults)
@@ -335,6 +410,12 @@ def create_app(config: dict | None = None) -> Flask:
         binding = store.binding_for(user_id)
         if binding:
             name, player_id = binding
+            if player_id is None:
+                # 綁定時還是新人，之後才同步進 soga.db：補上 id，之後改名才跟得上。
+                player_id = players.player_id(name)
+                if player_id is not None:
+                    store.set_player_id(user_id, player_id)
+                    logger.info("補上玩家 id %s → %s（#%s）", user_id, name, player_id)
             return players.current_name(player_id) or players.canonical(name)
         line_name = (line.display_name(source) or "").strip()
         player_id = players.player_id(line_name)

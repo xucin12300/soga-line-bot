@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -29,13 +30,21 @@ class SogaPlayers:
         self._current: dict[int, str] = {}  # id → 目前的名字
         self._by_name: dict[str, int] = {}  # 任何用過的名字 → id
         self._loaded_at = 0.0
+        self._mtime: float | None = None
         self._lock = threading.Lock()
 
     def _refresh(self) -> None:
+        # soga.db 一同步過來就重讀：新玩家同步進來後馬上打「綁定」，不能還拿
+        # 十分鐘前的名單說他不在名單裡。
+        try:
+            mtime = os.stat(self.db_path).st_mtime if self.db_path else None
+        except OSError:
+            mtime = None
         with self._lock:
-            if time.monotonic() - self._loaded_at > CACHE_SECONDS:
+            if mtime != self._mtime or time.monotonic() - self._loaded_at > CACHE_SECONDS:
                 self._current, self._by_name = self._load()
                 self._loaded_at = time.monotonic()
+                self._mtime = mtime
 
     def names(self) -> set[str]:
         """目前所有正式成員的名字。"""

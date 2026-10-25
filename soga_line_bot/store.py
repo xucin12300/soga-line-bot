@@ -27,6 +27,8 @@ from .parser import Slot
 DEFAULT_CHAT_ID = "default"
 NAME_PREFIX = "name:"
 MANUAL_CHAT_ID = "manual"
+# 第 capacity+1 個以後沒寫備註的人，備註自動變成這個；遞補進前 capacity 個時拿掉。
+WAITLIST_NOTE = "備取"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signups (
@@ -98,8 +100,10 @@ class Entry:
 
 
 class SignupStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str, capacity: int = 4):
         self.path = path
+        # 一格的正取人數（一桌）。超過的人照樣登記，但一定要有備註，沒寫就是「備取」。
+        self.capacity = capacity
         # 一個 gunicorn worker 裡有好幾條 thread；「先查有沒有、沒有才新增」這種
         # 兩步驟要整段鎖住才不會重複。
         self._lock = threading.Lock()
@@ -124,10 +128,13 @@ class SignupStore:
         finally:
             conn.close()
 
-    def add(self, chat_id: str, user_id: str, slot: Slot, capacity: int, now: datetime, note: str = "") -> str:
-        """登記一個時段。回傳 "added"、"noted"（已經登記過、這次只更新備註）、
-        "exists"（已經登記過）或 "full"（滿了）。人數檢查跟新增在同一把鎖裡，兩群
-        同時搶最後一個位子也只會進去一個。"""
+    def add(self, chat_id: str, user_id: str, slot: Slot, now: datetime, note: str = "") -> str:
+        """登記一個時段。回傳：
+        - "added"：排進前 capacity 個（正取）
+        - "waitlisted"：第 capacity+1 個以後，沒寫備註的話備註是「備取」
+        - "noted"：已經登記過，這次只更新備註
+        - "exists"：已經登記過
+        排位跟新增在同一把鎖裡，兩群同時搶最後一個正取位也只會進去一個。"""
         with self._lock, self._connect() as conn:
             taken = [
                 row["user_id"]
@@ -143,26 +150,46 @@ class SignupStore:
                     "UPDATE signups SET note=? WHERE user_id=? AND slot_date=? AND period=? AND cancelled_at IS NULL",
                     (note, user_id, slot.day.isoformat(), slot.period),
                 )
+                self._normalize(conn, slot)
                 return "noted"
-            if len(taken) >= capacity:
-                return "full"
             conn.execute(
                 "INSERT INTO signups (chat_id, user_id, slot_date, period, note, created_at) VALUES (?,?,?,?,?,?)",
                 (chat_id, user_id, slot.day.isoformat(), slot.period, note, now.isoformat(timespec="seconds")),
             )
-            return "added"
+            self._normalize(conn, slot)
+            return "added" if len(taken) < self.capacity else "waitlisted"
 
-    def remove(self, user_id: str, slot: Slot, now: datetime) -> bool:
-        """取消一個時段，回傳是否真的有取消到。"""
+    def remove(self, user_id: str, slot: Slot, now: datetime) -> tuple[bool, list[str]]:
+        """取消一個時段，回傳 (是否真的有取消到, 因此遞補成正取的 user_id)。"""
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE signups SET cancelled_at=? WHERE user_id=? AND slot_date=? AND period=? AND cancelled_at IS NULL",
                 (now.isoformat(timespec="seconds"), user_id, slot.day.isoformat(), slot.period),
             )
-            return cursor.rowcount > 0
+            if cursor.rowcount == 0:
+                return False, []
+            return True, self._normalize(conn, slot)
 
-    def remove_all(self, user_id: str, today: date, now: datetime) -> list[Slot]:
-        """取消這個人今天起所有的登記，回傳取消掉的時段（依時間排序）。"""
+    def _normalize(self, conn, slot: Slot) -> list[str]:
+        """整理一格的備取：依登記先後，前 capacity 個是正取，備註是「備取」的拿掉
+        （遞補）；之後的人一定要有備註，沒有就補上「備取」。回傳這次遞補成正取的
+        user_id。每次這一格有人進出都要呼叫。"""
+        rows = conn.execute(
+            "SELECT id, user_id, note FROM signups WHERE slot_date=? AND period=? AND cancelled_at IS NULL ORDER BY id",
+            (slot.day.isoformat(), slot.period),
+        ).fetchall()
+        promoted = []
+        for position, row in enumerate(rows):
+            if position < self.capacity and row["note"] == WAITLIST_NOTE:
+                conn.execute("UPDATE signups SET note='' WHERE id=?", (row["id"],))
+                promoted.append(row["user_id"])
+            elif position >= self.capacity and not row["note"]:
+                conn.execute("UPDATE signups SET note=? WHERE id=?", (WAITLIST_NOTE, row["id"]))
+        return promoted
+
+    def remove_all(self, user_id: str, today: date, now: datetime) -> tuple[list[Slot], dict[Slot, list[str]]]:
+        """取消這個人今天起所有的登記，回傳 (取消掉的時段（依時間排序）,
+        {時段: 因此遞補成正取的 user_id})。"""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, slot_date, period FROM signups WHERE user_id=? AND slot_date>=? AND cancelled_at IS NULL",
@@ -172,7 +199,9 @@ class SignupStore:
                 "UPDATE signups SET cancelled_at=? WHERE id=?",
                 [(now.isoformat(timespec="seconds"), row["id"]) for row in rows],
             )
-        return sorted((Slot(date.fromisoformat(row["slot_date"]), row["period"]) for row in rows), key=lambda s: s.sort_key)
+            slots = sorted((Slot(date.fromisoformat(row["slot_date"]), row["period"]) for row in rows), key=lambda s: s.sort_key)
+            promoted = {slot: ids for slot in slots if (ids := self._normalize(conn, slot))}
+        return slots, promoted
 
     def entries(self, date_from: date, date_to: date) -> list[Entry]:
         """[date_from, date_to] 之間（含兩端）所有有效的登記，依登記先後排序。"""
@@ -233,6 +262,7 @@ class SignupStore:
                     (MANUAL_CHAT_ID, bound.get(name, NAME_PREFIX + name), slot.day.isoformat(), slot.period, note, stamp),
                 )
                 added.append(name)
+            self._normalize(conn, slot)
         return added, removed
 
     def active_slots(self, date_from: date, date_to: date) -> set[Slot]:
@@ -319,6 +349,8 @@ class SignupStore:
                         "INSERT OR IGNORE INTO signups (chat_id, user_id, slot_date, period, created_at) VALUES (?,?,?,?,?)",
                         (DEFAULT_CHAT_ID, bound.get(canonical(name), NAME_PREFIX + name), day, period, stamp),
                     )
+            for weekday, period, _ in defaults:
+                self._normalize(conn, Slot(start + timedelta(days=weekday), period))
             slots = ",".join(f"{weekday}{period}" for weekday, period, _ in defaults)
             conn.execute(
                 "INSERT INTO seeded_weeks (week_start, slots, created_at) VALUES (?,?,?)", (start.isoformat(), slots, stamp)

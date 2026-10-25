@@ -5,6 +5,7 @@
     +五晚            登記週五晚上
     +一晚 三晚       一次登記好幾個
     +六晚 晚點到     時段後面的字是自己的備註（表上變成「名字（晚點到）」）
+    +下禮拜的六午    指定下週；「下下禮拜」是下下週（週、周、星期、禮拜都可以，「的」可省）
     -五晚            取消
     取消             取消自己今天起所有的登記（「全部取消」也可以）
     名單             看這週的表
@@ -15,7 +16,8 @@
     修改班底 + 表    管理員換掉固定班底表（「修改DEFAULT」也可以）
 
 星期是 一～日（「天」也算日），時段是 早 午 晚 夜。日期是今天起算最近的那
-一天：今天週五打「+五晚」是今晚，打「+四晚」就是下週四。
+一天：今天週五打「+五晚」是今晚，打「+四晚」就是下週四。前面加「下禮拜」就是
+下一個日曆週（週一開始）的那天，不管今天星期幾；「下下禮拜」再往後一週。
 
 只有符合上面格式的訊息才算指令，其餘聊天一律不理——bot 放在群組裡，不能每句
 話都回。全形的＋－會先轉成半形。
@@ -36,12 +38,15 @@ NOTE_MAX_LENGTH = 15
 # 同一天裡的排序，也是表上的順序。
 PERIODS = "早午晚夜"
 
-_SLOT_COMMAND = re.compile(r"^([+\-])\s*((?:[一二三四五六日天]\s*[早午晚夜][\s,，、]*)+)")
+# group(2) 是「下」的個數（下禮拜、下下禮拜…），group(3) 是時段們。
+_SLOT_COMMAND = re.compile(
+    r"^([+\-])\s*(?:(下+)\s*個?\s*(?:週|周|星期|禮拜)\s*的?\s*)?((?:[一二三四五六日天]\s*[早午晚夜][\s,，、]*)+)"
+)
 _SLOT = re.compile(r"([一二三四五六日天])\s*([早午晚夜])")
 _BIND = re.compile(r"^綁定\s*(\S{0,20})$")
 _BOARD_WORDS = {"名單", "表", "登記表"}
 _CANCEL_ALL_WORDS = {"取消", "全部取消"}
-_HELP_WORDS = {"說明", "指令", "help"}
+_HELP_WORDS = {"說明", "指令", "功能", "help"}
 _LEADING_MENTION = re.compile(r"^@\S+\s*")
 
 
@@ -83,8 +88,14 @@ def parse(text: str, today: date) -> Command | None:
     match = _SLOT_COMMAND.match(text)
     if match:
         slots: list[Slot] = []
-        for day_char, period in _SLOT.findall(match.group(2)):
-            slot = Slot(next_weekday(today, WEEKDAYS.index("日" if day_char == "天" else day_char)), period)
+        weeks_ahead = len(match.group(2) or "")
+        for day_char, period in _SLOT.findall(match.group(3)):
+            weekday = WEEKDAYS.index("日" if day_char == "天" else day_char)
+            if weeks_ahead:
+                day = week_start(today) + timedelta(days=7 * weeks_ahead + weekday)
+            else:
+                day = next_weekday(today, weekday)
+            slot = Slot(day, period)
             if slot not in slots:
                 slots.append(slot)
         if match.group(1) == "-":

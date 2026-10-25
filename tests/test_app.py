@@ -3,12 +3,14 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
 
 from soga_line_bot.app import create_app
+from soga_line_bot.line_api import _text_v2, mention, strip_mentions
 from soga_line_bot.parser import TZ
 from soga_line_bot.players import SogaPlayers
 
@@ -41,17 +43,40 @@ EMPTY_WEEK = """26/10/19 - 26/10/25
 class FakeLine:
     def __init__(self):
         self.replies = []
+        self.members = {}
+        self.pushes = []
+        self.mentions = []
         # U1 的 LINE 名字剛好就是 SOGA 名字；U2 不是。
         self.names = {"U1": "小魚", "U2": "阿華華", "U3": "隨便"}
 
     def reply_text(self, reply_token, text):
-        self.replies.append(text)
+        # 測試看的是使用者看到的文字；@ 了誰另外記下來。
+        self.mentions = re.findall(r"\x00(U\w+)\x00", text)
+        self.replies.append(strip_mentions(text))
 
     def display_name(self, source):
         return self.names.get(source.get("userId"))
 
     def group_name(self, group_id):
         return {"Cgroup-a": "A 群", "Cgroup-b": "B 群"}.get(group_id)
+
+    # 群組成員：沒列在這裡的群組當作每個人都在。
+    members: dict = {}
+    pushes: list = []
+    quota = 200
+
+    def is_member(self, chat_type, chat_id, user_id):
+        return chat_type in ("group", "room") and (chat_id not in self.members or user_id in self.members[chat_id])
+
+    def member_count(self, chat_type, chat_id):
+        return 30
+
+    def quota_left(self):
+        return self.quota
+
+    def push_text(self, to, text):
+        self.pushes.append((to, re.findall(r"\x00(U\w+)\x00", text), strip_mentions(text)))
+        return True
 
 
 class BotTestCase(unittest.TestCase):
@@ -167,20 +192,29 @@ class AppTest(BotTestCase):
         self.assertIn("\n五晚 日日\n", reply)
         self.assertIn("\n六午\n", reply)
 
-    def test_slot_capacity(self):
-        users = {"U1": "小魚", "U2": "日日", "U3": "阿凱", "U4": "吉詳", "U5": "安妮"}
+    def test_waitlist_and_promotion(self):
+        users = {"U1": "小魚", "U2": "日日", "U3": "阿凱", "U4": "吉詳", "U5": "安妮", "U6": "大樹"}
         self.line.names.update(users)
-        for user in ["U2", "U3", "U4", "U5"]:
+        for user in ["U2", "U3", "U4", "U5", "U6"]:
             self.say(f"綁定 {users[user]}", user=user)
         for user in ["U1", "U2", "U3", "U4"]:
             self.assertIn("✅", self.say("+五晚", user=user, chat=GROUP_A if user < "U3" else GROUP_B))
+        # 第五個：沒寫備註 → 備取。
         reply = self.say("+五晚 六午", user="U5")
         self.assertIn("✅ 安妮 +六午", reply)
-        self.assertIn("❌ 五晚 已經滿 4 人了", reply)
-        self.assertIn("\n五晚 小魚 日日 阿凱 吉詳\n", reply)
-        # 有人取消就空出位子。
-        self.say("-五晚", user="U3")
-        self.assertIn("✅ 安妮 +五晚", self.say("+五晚", user="U5"))
+        self.assertIn("🕒 安妮 +五晚（備取）", reply)
+        self.assertIn("\n五晚 小魚 日日 阿凱 吉詳 安妮（備取）\n", reply)
+        # 第六個：自己寫備註就用他的備註。
+        self.assertIn("🕒 大樹 +五晚（可以替補）", self.say("+五晚 可以替補", user="U6"))
+        # 已經在裡面的人直接改備註。
+        self.assertIn("📝 小魚 五晚 備註改成（晚點到）", self.say("+五晚 晚點到"))
+        # 正取有人取消 → 第一個備取遞補，「備取」拿掉。
+        reply = self.say("-五晚", user="U3")
+        self.assertIn("⬆️ 安妮 遞補 五晚", reply)
+        self.assertIn("\n五晚 小魚（晚點到） 日日 吉詳 安妮 大樹（可以替補）\n", reply)
+        # 再取消一個：大樹遞補，但他自己寫的備註保留。
+        self.say("取消", user="U2")
+        self.assertIn("\n五晚 小魚（晚點到） 吉詳 安妮 大樹（可以替補）\n", self.say("名單"))
 
     def test_next_week_and_extra_slot(self):
         reply = self.say("+一晚 三午")
@@ -276,7 +310,12 @@ class WeeklyDefaultsTest(BotTestCase):
 
     def test_roster_counts_toward_capacity(self):
         self.say("綁定 新朋友", user="U3")
-        self.assertIn("❌ 二晚 已經滿 4 人了", self.say("+二晚", user="U3"))
+        reply = self.say("+二晚", user="U3")
+        self.assertIn("🕒 新朋友 +二晚（備取）", reply)
+        self.assertIn("\n二晚 美顏 跳跳 安妮 胖弟 新朋友（備取、新人）\n", reply)
+        # 班底有人取消 → 遞補。
+        self.say("綁定 安妮", user="U2")
+        self.assertIn("⬆️ 新朋友 遞補 二晚", self.say("-下禮拜的二晚", user="U2"))
 
     def test_roster_member_cancels_after_binding(self):
         # U1 的 LINE 名字是「小魚」，第一次打指令就自動綁定，佔位登記換成他的帳號。
@@ -339,9 +378,9 @@ class SetBoardTest(BotTestCase):
         self.assertIn("\n日午 玖玖 兔子（1415到）\n", text)
         # 沒列到的時段不動。
         self.assertIn("\n六晚 嘉嘉\n", text)
-        # 已經滿 4 人。
+        # 已經 4 人，再來的是備取。
         self.say("綁定 新朋友", user="U3")
-        self.assertIn("❌ 五晚 已經滿 4 人了", self.say("+五晚", user="U3"))
+        self.assertIn("🕒 新朋友 +五晚（備取）", self.say("+五晚", user="U3"))
 
 
 class OverwriteTest(BotTestCase):
@@ -356,9 +395,10 @@ class OverwriteTest(BotTestCase):
         reply = self.say(
             "覆蓋\n26/10/19 - 26/10/25\n五晚 榮恩 兔子 大樹 安妮 阿凱\n六午 賤綠\n六晚\n日午 玖玖 兔子（1415到）\n日晚 小米"
         )
+        # 第五個沒寫備註，覆蓋時一樣自動變備取。
         self.assertEqual(
             reply,
-            "✅ 已覆蓋整張表\n\n26/10/19 - 26/10/25\n五晚 榮恩 兔子 大樹 安妮 阿凱\n六午 賤綠\n六晚\n"
+            "✅ 已覆蓋整張表\n\n26/10/19 - 26/10/25\n五晚 榮恩 兔子 大樹 安妮 阿凱（備取）\n六午 賤綠\n六晚\n"
             "日午 玖玖 兔子（1415到）\n日晚 小米",
         )
         # 今天以前的格子不動（API 整週都給）。
@@ -433,6 +473,30 @@ class RenameTest(BotTestCase):
         self.assertIn("已經被另一個 LINE 帳號綁定", self.say("綁定 凱凱", user="U3"))
         self.assertIn("已經被另一個 LINE 帳號綁定", self.say("綁定 阿凱", user="U3"))
 
+    def test_newcomer_synced_later_gets_player_id(self):
+        self.assertIn("SOGA 名單裡還沒有這個名字", self.say("綁定 歐印", user="U2"))
+        self.say("+五晚", user="U2")
+        # soga.db 同步進來（檔案時間變了），不用等名單快取過期。
+        conn = sqlite3.connect(self.soga_db_path)
+        conn.execute("INSERT INTO history_player_info (current_name, history_name) VALUES ('歐印', '[\"歐印\"]')")
+        conn.commit()
+        conn.close()
+        st = os.stat(self.soga_db_path)
+        os.utime(self.soga_db_path, (st.st_atime, st.st_mtime + 10))
+        self.assertIn("已綁定：阿華華 → 歐印", self.say("綁定 歐印", user="U2"))
+        self.assertIn("\n五晚 歐印\n", self.say("名單"))
+
+        # 只綁過、沒重綁的人：下次用 bot 時自動補上 id，之後改名也跟得上。
+        self.say("綁定 新朋友", user="U3")
+        conn = sqlite3.connect(self.soga_db_path)
+        conn.execute("INSERT INTO history_player_info (current_name, history_name) VALUES ('新朋友', '[\"新朋友\"]')")
+        conn.commit()
+        conn.close()
+        self.app.config["PLAYERS"]._loaded_at = 0
+        self.assertIn("✅ 新朋友 +六午", self.say("+六午", user="U3"))
+        self.rename("新朋友", "老朋友")
+        self.assertIn("✅ 老朋友 +六晚", self.say("+六晚", user="U3"))
+
     def test_roster_with_old_name(self):
         self.make_app("五晚 榮五 兔子")
         self.assertIn("\n五晚 榮恩 兔子", self.say("名單"))
@@ -501,3 +565,53 @@ class MemberNoteTest(BotTestCase):
     def test_long_note_truncated(self):
         reply = self.say("+六晚 " + "很長" * 20)
         self.assertIn("小魚（" + ("很長" * 20)[:15] + "）", reply)
+
+
+
+class MentionTest(BotTestCase):
+    def test_promoted_user_is_mentioned(self):
+        self.line.names.update({"U4": "吉詳", "U5": "安妮"})
+        for user, name in [("U2", "日日"), ("U3", "阿凱"), ("U4", "吉詳"), ("U5", "安妮")]:
+            self.say(f"綁定 {name}", user=user)
+        for user in ["U1", "U2", "U3", "U4", "U5"]:
+            self.say("+五晚", user=user)
+        self.assertIn("⬆️ 安妮 遞補 五晚", self.say("-五晚", user="U3"))
+        self.assertEqual(self.line.mentions, ["U5"])
+
+    def test_text_v2_format(self):
+        uid = "U" + "a" * 32
+        message = _text_v2("⬆️ 安妮 " + mention(uid) + " 遞補 五晚 {x}")
+        self.assertEqual(message["text"], "⬆️ 安妮 {m0} 遞補 五晚 {{x}}")
+        self.assertEqual(message["substitution"]["m0"]["mentionee"], {"type": "user", "userId": uid})
+        self.assertEqual(strip_mentions("安妮 " + mention(uid) + " 遞補"), "安妮 遞補")
+
+
+
+class CrossGroupPromotionTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.app.config["ALLOWED_CHAT_IDS"] = {GROUP_A, GROUP_B}
+        self.line.names.update({"U4": "吉詳", "U5": "安妮"})
+        for user, name in [("U2", "日日"), ("U3", "阿凱"), ("U4", "吉詳"), ("U5", "安妮")]:
+            self.say(f"綁定 {name}", user=user)
+        for user in ["U1", "U2", "U3", "U4"]:
+            self.say("+五晚", user=user, chat=GROUP_A)
+        self.say("+五晚", user="U5", chat=GROUP_B)  # 安妮在 B 群登記，是備取
+
+    def test_tag_in_reply_when_same_group(self):
+        self.line.members = {GROUP_A: {"U1", "U2", "U3", "U4", "U5"}}
+        self.assertIn("⬆️ 安妮 遞補 五晚", self.say("-五晚", user="U3", chat=GROUP_A))
+        self.assertEqual(self.line.mentions, ["U5"])
+        self.assertEqual(self.line.pushes, [])
+
+    def test_push_to_own_group_when_elsewhere(self):
+        self.line.members = {GROUP_A: {"U1", "U2", "U3", "U4"}, GROUP_B: {"U5"}}
+        self.assertIn("⬆️ 安妮 遞補 五晚", self.say("-五晚", user="U3", chat=GROUP_A))
+        self.assertEqual(self.line.mentions, [])
+        self.assertEqual(self.line.pushes, [(GROUP_B, ["U5"], "⬆️ 安妮 遞補 五晚（10/23）")])
+
+    def test_no_push_when_quota_short(self):
+        self.line.members = {GROUP_A: {"U1", "U2", "U3", "U4"}, GROUP_B: {"U5"}}
+        self.line.quota = 10
+        self.say("-五晚", user="U3", chat=GROUP_A)
+        self.assertEqual(self.line.pushes, [])
